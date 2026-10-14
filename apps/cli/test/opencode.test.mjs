@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   buildTasks,
@@ -65,6 +66,30 @@ const tool = (id, mid, name, input, status = "completed", outputChars = 120, at 
   output_chars: outputChars,
 });
 const TOKENS = { input: 1000, output: 200, reasoning: 50, cache: { read: 40_000, write: 3000 } };
+
+test("the empty-history notice lists all three coding agents", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-notice-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL("../dist/cli.js", import.meta.url)), "scan", "--source", "sdk"],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        OPTIMAIZR_DIR: dir,
+        OPTIMAIZR_NO_UPDATE_CHECK: "1",
+        NO_COLOR: "1",
+      },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /nothing to analyse yet/);
+  assert.match(
+    result.stdout,
+    /optimAIzr reads Claude Code \(~\/\.claude\/projects\), Codex \(~\/\.codex\/sessions\) and opencode \(~\/\.local\/share\/opencode\)\./,
+  );
+});
 
 test("a step-finish becomes one call with opencode's counts", () => {
   const out = mapOpencodeRows(

@@ -104,7 +104,9 @@ export function emptyNotice(): void {
   console.log("");
   console.log(`  ${bold("Your coding agents")} ${dim("- no changes required")}`);
   console.log(
-    `    ${dim("optimAIzr reads Claude Code (~/.claude/projects) and Codex (~/.codex/sessions).")}`,
+    `    ${dim(
+      "optimAIzr reads Claude Code (~/.claude/projects), Codex (~/.codex/sessions) and opencode (~/.local/share/opencode).",
+    )}`,
   );
   console.log("");
   console.log(`  ${bold("Your app")} ${dim("- one line, Anthropic or OpenAI")}`);
