@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 import {
   buildTasks,
@@ -7,7 +11,11 @@ import {
   coldResumes,
   conversations,
   costOf,
+  ingestOpencode,
+  loadSqlite,
   mapOpencodeRows,
+  opencodeDbPath,
+  readOpencodeRows,
   toolSignatureOf,
   toolTargetOf,
 } from "@optimaizr/core";
@@ -527,4 +535,341 @@ test("a compaction after a finished reply is not mid-task", () => {
   );
   assert.equal(out.compactions.length, 1);
   assert.equal(out.compactions[0].midTask, false);
+});
+
+const sqlite = await loadSqlite();
+const noSqlite = sqlite ? false : "node:sqlite needs Node 22.13+";
+
+/** opencode's tables and indexes, with WAL so a writer can stay open. */
+function opencodeDb(t, fill) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-"));
+  const file = path.join(dir, "opencode.db");
+  const db = new sqlite.DatabaseSync(file);
+  let closed = false;
+  function close() {
+    db.close();
+    closed = true;
+  }
+  t.after(() => {
+    if (!closed) close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE session (id text PRIMARY KEY, project_id text NOT NULL, parent_id text,
+      slug text NOT NULL, directory text NOT NULL, title text NOT NULL, version text NOT NULL,
+      model text, time_created integer NOT NULL, time_updated integer NOT NULL);
+    CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL,
+      time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
+    CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL,
+      time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
+    CREATE INDEX part_session_idx ON part (session_id);
+    CREATE INDEX message_session_time_created_id_idx ON message (session_id, time_created, id);
+  `);
+  fill?.(db);
+  return { file, db, close };
+}
+
+function insertSession(db, id, at, over = {}) {
+  db.prepare(
+    "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated) VALUES (?, 'p', ?, 's', ?, ?, '1.19.0', ?, ?, ?)",
+  ).run(
+    id,
+    over.parent ?? null,
+    over.directory ?? "/home/someone/project",
+    over.title ?? "A session",
+    JSON.stringify({ id: "claude-sonnet-5", providerID: "anthropic", variant: "high" }),
+    at,
+    at,
+  );
+}
+
+function insertCall(db, sid, n, at, data = {}) {
+  const mid = `msg_${sid}_${n}`;
+  db.prepare("INSERT INTO message VALUES (?, ?, ?, ?, ?)").run(
+    mid,
+    sid,
+    at,
+    at,
+    JSON.stringify({ role: "assistant", parentID: "msg_u", modelID: "claude-sonnet-5", ...data }),
+  );
+  db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)").run(
+    `prt_${sid}_${n}a`,
+    mid,
+    sid,
+    at,
+    at,
+    JSON.stringify({
+      type: "tool",
+      tool: "read",
+      callID: "c1",
+      state: {
+        status: "completed",
+        input: { filePath: "/a" },
+        output: "x".repeat(321),
+        metadata: { large: "discard" },
+      },
+    }),
+  );
+  db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)").run(
+    `prt_${sid}_${n}b`,
+    mid,
+    sid,
+    at + 1,
+    at + 1,
+    JSON.stringify({ type: "step-finish", reason: "stop", tokens: TOKENS, cost: 0 }),
+  );
+  db.prepare("UPDATE session SET time_updated = ? WHERE id = ?").run(at + 1, sid);
+}
+
+test(
+  "ingestOpencode reads calls, titles, window and tool output size",
+  { skip: noSqlite },
+  async (t) => {
+    const { file, close } = opencodeDb(t, (db) => {
+      insertSession(db, "ses_a", T0, { title: "Fix the parser" });
+      insertCall(db, "ses_a", 1, T0 + 1000);
+    });
+    close();
+    const data = await ingestOpencode({ db: file });
+    assert.equal(data.events.length, 1);
+    assert.equal(data.events[0].tools[0].resultChars, 321);
+    assert.deepEqual(data.titles, { ses_a: "Fix the parser" });
+    assert.deepEqual(data.sources, [file]);
+    assert.deepEqual(data.warnings, []);
+    assert.deepEqual(data.window, { from: data.events[0].ts, to: data.events[0].ts, days: 1 });
+  },
+);
+
+test(
+  "reads committed calls while a WAL writer holds an uncommitted write",
+  { skip: noSqlite },
+  async (t) => {
+    const { file, db } = opencodeDb(t, (db) => insertSession(db, "ses_a", T0));
+    insertCall(db, "ses_a", 1, T0 + 1000);
+    db.exec("BEGIN IMMEDIATE");
+    insertCall(db, "ses_a", 2, T0 + 2000);
+    try {
+      const data = await ingestOpencode({ db: file });
+      assert.deepEqual(
+        data.events.map((e) => e.id),
+        ["ses_a#prt_ses_a_1b"],
+      );
+      assert.deepEqual(data.warnings, []);
+    } finally {
+      db.exec("ROLLBACK");
+    }
+  },
+);
+
+test(
+  "days bounds sessions but keeps their history for compactions",
+  { skip: noSqlite },
+  async (t) => {
+    const now = Date.now();
+    const old = now - 20 * 86_400_000;
+    const { file } = opencodeDb(t, (db) => {
+      insertSession(db, "ses_old", old);
+      insertCall(db, "ses_old", 1, old);
+      insertSession(db, "ses_new", old);
+      insertCall(db, "ses_new", 1, old);
+      insertCall(db, "ses_new", 2, now - 4000, { summary: true });
+      insertCall(db, "ses_new", 3, now - 2000);
+    });
+    const data = await ingestOpencode({ db: file, days: 7, project: "PROJECT" });
+    assert.deepEqual(
+      data.events.map((e) => e.id),
+      ["ses_new#prt_ses_new_2b", "ses_new#prt_ses_new_3b"],
+    );
+    assert.equal(data.events[1].contextEpoch, 1);
+    assert.equal(data.compactions[0].preTokens, 44_000);
+    assert.equal((await ingestOpencode({ db: file, project: "elsewhere" })).events.length, 0);
+  },
+);
+
+test(
+  "readOpencodeRows retains old ancestors and accepts explicit session ids",
+  { skip: noSqlite },
+  (t) => {
+    const { db } = opencodeDb(t, (db) => {
+      insertSession(db, "ses_root", T0);
+      insertCall(db, "ses_root", 1, T0);
+      insertSession(db, "ses_child", T0 + 2000, { parent: "ses_root", directory: "" });
+      insertCall(db, "ses_child", 1, T0 + 2000);
+    });
+    for (const opts of [{ since: T0 + 1000 }, { sessionIds: ["ses_child"], since: 1e15 }]) {
+      const read = readOpencodeRows(db, opts);
+      assert.equal(read.sessions.length, 2);
+      assert.deepEqual(
+        read.messages.map((m) => m.session_id),
+        ["ses_child"],
+      );
+      assert.equal(mapOpencodeRows(read).events[0].sessionId, "ses_root");
+      assert.equal(mapOpencodeRows(read).events[0].project, "/home/someone/project");
+      const state = JSON.parse(read.parts[0].data).state;
+      assert.equal(state.output, undefined);
+      assert.equal(state.metadata, undefined);
+      assert.equal(read.parts[0].output_chars, 321);
+    }
+    assert.equal(readOpencodeRows(db, { sessionIds: [] }).messages.length, 0);
+  },
+);
+
+test(
+  "malformed SQL rows join the mapper's warning and are scoped to selected sessions",
+  { skip: noSqlite },
+  async (t) => {
+    const { file, db } = opencodeDb(t, (db) => {
+      const old = Date.now() - 20 * 86_400_000;
+      insertSession(db, "ses_old", old);
+      insertCall(db, "ses_old", 1, old);
+      insertSession(db, "ses_a", Date.now() - 5000);
+      insertCall(db, "ses_a", 1, Date.now() - 4000);
+    });
+    db.prepare("UPDATE part SET data = ? WHERE id = ?").run("{oops", "prt_ses_a_1a");
+    db.prepare("UPDATE message SET data = ? WHERE session_id = ?").run("{oops", "ses_old");
+    const one = await ingestOpencode({ db: file, days: 7 });
+    assert.equal(one.events.length, 1);
+    assert.deepEqual(one.warnings, ["opencode: skipped 1 unparseable row(s)"]);
+    db.prepare("UPDATE message SET time_created = ? WHERE session_id = ?").run(1e30, "ses_a");
+    assert.deepEqual((await ingestOpencode({ db: file, days: 7 })).warnings, [
+      "opencode: skipped 2 unparseable row(s)",
+    ]);
+    assert.deepEqual((await ingestOpencode({ db: file })).warnings, [
+      "opencode: skipped 3 unparseable row(s)",
+    ]);
+  },
+);
+
+test("reader chunks ids and uses opencode's message and part indexes", { skip: noSqlite }, (t) => {
+  const { db } = opencodeDb(t, (db) => {
+    for (let i = 0; i < 501; i++) {
+      insertSession(db, `ses_${i}`, T0);
+      insertCall(db, `ses_${i}`, 1, T0);
+    }
+  });
+  const queries = [];
+  const read = readOpencodeRows({
+    prepare(sql) {
+      return {
+        all(...params) {
+          queries.push({ sql, params });
+          return db.prepare(sql).all(...params);
+        },
+      };
+    },
+    close() {},
+  });
+  assert.equal(read.messages.length, 501);
+  assert.equal(read.parts.length, 1002);
+  for (const [table, index] of [
+    ["part", "part_session_idx"],
+    ["message", "message_session_time_created_id_idx"],
+  ]) {
+    const selected = queries.filter(
+      ({ sql }) => sql.includes(`FROM ${table} `) && !sql.includes("count(*)"),
+    );
+    assert.equal(selected.length, 2);
+    for (const { sql, params } of selected) {
+      assert.ok(params.length <= 500);
+      const plan = db
+        .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+        .all(...params)
+        .map((r) => r.detail)
+        .join("\n");
+      assert.ok(plan.includes(index), plan);
+      assert.doesNotMatch(plan, /SCAN (?:p|m)\b/);
+    }
+  }
+});
+
+test("mapper errors become an ingestion warning", { skip: noSqlite }, async (t) => {
+  const { file } = opencodeDb(t, (db) => {
+    insertSession(db, "ses_a", T0);
+    insertCall(db, "ses_a", 1, T0);
+  });
+  const data = await ingestOpencode({
+    db: file,
+    project: {
+      toLowerCase() {
+        throw new Error("mapper failed");
+      },
+    },
+  });
+  assert.equal(data.events.length, 0);
+  assert.deepEqual(data.warnings, ["opencode.db: mapper failed"]);
+});
+
+test("a missing database warns before checking SQLite availability", async () => {
+  const data = await ingestOpencode({
+    db: path.join(process.cwd(), ".no-such-opencode-dir", "opencode.db"),
+  });
+  assert.equal(data.events.length, 0);
+  assert.ok(data.warnings[0].startsWith("No opencode history found at"));
+});
+
+test("an existing non-database file warns, including when SQLite is unavailable", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "opencode.db");
+  fs.writeFileSync(file, "not sqlite");
+  const data = await ingestOpencode({ db: file });
+  assert.equal(data.events.length, 0);
+  assert.equal(data.warnings.length, 1);
+  if (!sqlite)
+    assert.equal(data.warnings[0], "opencode history needs Node 22.13+ (node:sqlite); skipped");
+});
+
+test("a database with an incompatible schema warns", { skip: noSqlite }, async (t) => {
+  const { file, db } = opencodeDb(t, (db) => insertSession(db, "ses_a", T0));
+  db.exec("DROP TABLE part");
+  const data = await ingestOpencode({ db: file });
+  assert.equal(data.events.length, 0);
+  assert.equal(data.warnings.length, 1);
+});
+
+test("loadSqlite suppresses only its SQLite ExperimentalWarning", () => {
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+    import { loadSqlite } from '@optimaizr/core';
+    const before = process.emitWarning;
+    const first = loadSqlite();
+    if (first !== loadSqlite()) throw new Error('loader is not cached');
+    await first;
+    if (process.emitWarning !== before) throw new Error('warning hook not restored');
+    process.emitWarning('unrelated warning');
+  `,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(child.status, 0, child.stderr);
+  assert.doesNotMatch(child.stderr, /ExperimentalWarning/);
+  assert.match(child.stderr, /unrelated warning/);
+});
+
+test("the database lives under XDG_DATA_HOME when set", () => {
+  const before = process.env.XDG_DATA_HOME;
+  try {
+    process.env.XDG_DATA_HOME = " /tmp/xdg ";
+    assert.equal(opencodeDbPath(), path.join("/tmp/xdg", "opencode", "opencode.db"));
+    process.env.XDG_DATA_HOME = "~/data";
+    assert.equal(opencodeDbPath(), path.join(os.homedir(), "data", "opencode", "opencode.db"));
+    process.env.XDG_DATA_HOME = " ";
+    assert.equal(
+      opencodeDbPath(),
+      path.join(os.homedir(), ".local", "share", "opencode", "opencode.db"),
+    );
+    delete process.env.XDG_DATA_HOME;
+    assert.equal(
+      opencodeDbPath(),
+      path.join(os.homedir(), ".local", "share", "opencode", "opencode.db"),
+    );
+  } finally {
+    if (before === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = before;
+  }
 });

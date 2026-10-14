@@ -1,6 +1,9 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { costOf, PROVIDERS, providerOf } from "../pricing.js";
-import { toolSignatureOf, toolTargetOf } from "./claudecode.js";
-import type { CompactionRecord, ToolCall, UsageEvent } from "../domain/types.js";
+import { toolSignatureOf, toolTargetOf, userPath } from "./claudecode.js";
+import type { CompactionRecord, Dataset, ToolCall, UsageEvent } from "../domain/types.js";
 
 /**
  * opencode history, the third agent beside Claude Code and Codex. opencode
@@ -46,6 +49,8 @@ export interface OpencodeRows {
   sessions: OpencodeSessionRow[];
   messages: OpencodeMessageRow[];
   parts: OpencodePartRow[];
+  /** Invalid JSON left behind by the reader. */
+  unparseableRows?: number;
 }
 
 export interface OpencodeMapOptions {
@@ -184,7 +189,7 @@ export function mapOpencodeRows(rows: OpencodeRows, opts: OpencodeMapOptions = {
   const events: UsageEvent[] = [];
   const compactions: CompactionRecord[] = [];
   const titles: Record<string, string> = {};
-  let bad = 0;
+  let bad = rows.unparseableRows ?? 0;
   let unnamed = 0;
 
   const sessions = new Map(rows.sessions.map((s) => [s.id, s]));
@@ -316,4 +321,151 @@ export function mapOpencodeRows(rows: OpencodeRows, opts: OpencodeMapOptions = {
     titles,
     warnings,
   };
+}
+
+/** `$XDG_DATA_HOME/opencode`, else ~/.local/share/opencode. */
+export function opencodeDbPath(): string {
+  const set = process.env.XDG_DATA_HOME?.trim();
+  const base = set ? userPath(set) : path.join(os.homedir(), ".local", "share");
+  return path.join(base, "opencode", "opencode.db");
+}
+
+/** The slice of `node:sqlite` used here; Node 20's types don't have it. */
+export interface SqliteDb {
+  prepare(sql: string): { all(...params: unknown[]): unknown[] };
+  close(): void;
+}
+
+export interface SqliteModule {
+  DatabaseSync: new (file: string, opts?: { readOnly?: boolean }) => SqliteDb;
+}
+
+let sqlite: Promise<SqliteModule | null> | undefined;
+
+/** SQLite where available, suppressing its one-time experimental warning. */
+export function loadSqlite(): Promise<SqliteModule | null> {
+  sqlite ??= (async () => {
+    // A variable keeps TypeScript and the bundler from resolving it.
+    const specifier = "node:sqlite";
+    const emit = process.emitWarning;
+    process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
+      const text = typeof warning === "string" ? warning : warning.message;
+      const type = typeof warning === "string" ? rest[0] : warning.name;
+      if (type === "ExperimentalWarning" && /SQLite/i.test(text)) return;
+      return (emit as (...args: unknown[]) => void).call(process, warning, ...rest);
+    }) as typeof process.emitWarning;
+    try {
+      return (await import(specifier)) as SqliteModule;
+    } catch {
+      return null;
+    } finally {
+      process.emitWarning = emit;
+    }
+  })();
+  return sqlite;
+}
+
+export interface OpencodeReadOptions {
+  since?: number;
+  sessionIds?: string[];
+}
+
+/**
+ * Read selected sessions' full history, retaining all ancestors for root
+ * resolution. Indexed, bounded queries leave tool output and bad JSON behind.
+ */
+export function readOpencodeRows(db: SqliteDb, opts: OpencodeReadOptions = {}): OpencodeRows {
+  const ids =
+    opts.sessionIds ??
+    (
+      db.prepare("SELECT id FROM session WHERE time_updated >= ?").all(opts.since ?? 0) as {
+        id: string;
+      }[]
+    ).map((s) => s.id);
+  const rows: OpencodeRows = {
+    sessions: db
+      .prepare("SELECT id, parent_id, directory, title, model FROM session")
+      .all() as OpencodeSessionRow[],
+    messages: [],
+    parts: [],
+    unparseableRows: 0,
+  };
+  const selected = [...new Set(ids)];
+  for (let start = 0; start < selected.length; start += 500) {
+    const chunk = selected.slice(start, start + 500);
+    const placeholders = chunk.map(() => "?").join(", ");
+    rows.messages.push(
+      ...(db
+        .prepare(
+          `SELECT m.id, m.session_id, m.time_created, m.data FROM message m
+       WHERE m.session_id IN (${placeholders}) AND json_valid(m.data)
+         AND json_extract(m.data, '$.role') = 'assistant'`,
+        )
+        .all(...chunk) as OpencodeMessageRow[]),
+    );
+    rows.parts.push(
+      ...(db
+        .prepare(
+          `SELECT p.id, p.message_id, p.session_id, p.time_created,
+         json_remove(p.data, '$.state.output', '$.state.metadata') AS data,
+         length(json_extract(p.data, '$.state.output')) AS output_chars
+       FROM part p WHERE p.session_id IN (${placeholders}) AND json_valid(p.data)
+         AND json_extract(p.data, '$.type') IN ('tool', 'step-finish')`,
+        )
+        .all(...chunk) as OpencodePartRow[]),
+    );
+    const [count] = db
+      .prepare(
+        `SELECT
+         (SELECT count(*) FROM message WHERE session_id IN (${placeholders}) AND NOT json_valid(data)) +
+         (SELECT count(*) FROM part WHERE session_id IN (${placeholders}) AND NOT json_valid(data)) AS bad`,
+      )
+      .all(...chunk, ...chunk) as { bad: number }[];
+    rows.unparseableRows = (rows.unparseableRows ?? 0) + (count?.bad ?? 0);
+  }
+  return rows;
+}
+
+export interface OpencodeIngestOptions {
+  /** Defaults to `opencodeDbPath()`. */
+  db?: string;
+  days?: number;
+  project?: string;
+}
+
+function emptyDataset(warnings: string[]): Dataset {
+  return { events: [], window: { from: "", to: "", days: 0 }, sources: [], warnings };
+}
+
+export async function ingestOpencode(opts: OpencodeIngestOptions = {}): Promise<Dataset> {
+  const file = opts.db ?? opencodeDbPath();
+  if (!fs.existsSync(file)) return emptyDataset([`No opencode history found at ${file}`]);
+
+  const sqlite = await loadSqlite();
+  if (!sqlite) return emptyDataset(["opencode history needs Node 22.13+ (node:sqlite); skipped"]);
+
+  try {
+    const db = new sqlite.DatabaseSync(file, { readOnly: true });
+    let mapped: OpencodeMapped;
+    try {
+      const rows = readOpencodeRows(db, {
+        since: opts.days ? Date.now() - opts.days * 86_400_000 : 0,
+      });
+      mapped = mapOpencodeRows(rows, opts);
+    } finally {
+      db.close();
+    }
+    const { events, compactions, titles, warnings } = mapped;
+    const from = events[0]?.ts ?? "";
+    const to = events[events.length - 1]?.ts ?? "";
+    const days =
+      from && to
+        ? Math.max(1, (new Date(to).getTime() - new Date(from).getTime()) / 86_400_000)
+        : 0;
+    return { events, window: { from, to, days }, sources: [file], warnings, compactions, titles };
+  } catch (err) {
+    return emptyDataset([
+      `${path.basename(file)}: ${err instanceof Error ? err.message : String(err)}`,
+    ]);
+  }
 }
