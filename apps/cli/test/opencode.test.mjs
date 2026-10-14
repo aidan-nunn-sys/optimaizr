@@ -11,6 +11,9 @@ import {
   coldResumes,
   conversations,
   costOf,
+  createCacheWatch,
+  createContextWatch,
+  ingest,
   ingestOpencode,
   loadSqlite,
   mapOpencodeRows,
@@ -19,6 +22,7 @@ import {
   toolSignatureOf,
   toolTargetOf,
 } from "@optimaizr/core";
+import "@optimaizr/local";
 
 const T0 = Date.parse("2026-10-10T12:00:00.000Z");
 
@@ -337,13 +341,10 @@ test("subagents join the root conversation while retaining their own event and t
   assert.equal(child.id, "ses_child#prt_child");
   assert.equal(child.turnId, "ses_child:msg_user1");
   assert.equal(child.project, "/home/someone/project");
-  // The opencode source filter is added in Task 3; exercise aggregation with a supported label.
-  const convos = conversations({
-    ...out,
-    events: out.events.map((e) => ({ ...e, source: "claude-code" })),
-  });
+  const convos = conversations(out);
   assert.equal(convos.length, 1);
   assert.equal(convos[0].sessionId, "ses_a");
+  assert.equal(convos[0].source, "opencode");
   assert.equal(convos[0].costUsd, out.events[0].cost.total + child.cost.total);
   assert.equal(convos[0].subagentUsd, child.cost.total);
 });
@@ -871,5 +872,86 @@ test("the database lives under XDG_DATA_HOME when set", () => {
   } finally {
     if (before === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = before;
+  }
+});
+
+test(
+  "a pinned transcripts root never reads the opencode database",
+  { skip: noSqlite },
+  async (t) => {
+    const xdg = fs.mkdtempSync(path.join(os.tmpdir(), "xdg-"));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "empty-root-"));
+    t.after(() => {
+      fs.rmSync(xdg, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+    fs.mkdirSync(path.join(xdg, "opencode"));
+    const { file, close } = opencodeDb(t, (db) => {
+      insertSession(db, "ses_a", Date.now() - 5000);
+      insertCall(db, "ses_a", 1, Date.now() - 4000);
+    });
+    close();
+    fs.renameSync(file, path.join(xdg, "opencode", "opencode.db"));
+    const before = process.env.XDG_DATA_HOME;
+    try {
+      process.env.XDG_DATA_HOME = xdg;
+      const pinned = await ingest([{ kind: "local-transcripts", root }]);
+      assert.equal(pinned.events.filter((e) => e.source === "opencode").length, 0);
+      const all = await ingest([{ kind: "local-transcripts" }]);
+      assert.equal(all.events.filter((e) => e.source === "opencode").length, 1);
+    } finally {
+      if (before === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = before;
+    }
+  },
+);
+
+test("opencode calls are conversations, and cache-watch follows them", () => {
+  // Over COLD_MIN_CONTEXT (50K), with a cache write, so the conversation counts as warm.
+  const big = { ...TOKENS, cache: { read: 60_000, write: 3000 } };
+  const out = mapOpencodeRows(
+    rows({
+      sessions: [session()],
+      messages: [message("msg_1", { modelID: "claude-sonnet-5" })],
+      parts: [step("prt_1", "msg_1", big)],
+    }),
+  );
+  assert.deepEqual(
+    conversations(out).map((c) => [c.sessionId, c.source, c.title]),
+    [["ses_a", "opencode", "Fix the parser"]],
+  );
+  const e = out.events[0];
+  const at = Date.parse(e.ts) + 1000;
+  const watch = createCacheWatch();
+  watch.push(e);
+  assert.equal(watch.warm(at).length, 1, "an opencode conversation is followed");
+  const sdk = createCacheWatch();
+  sdk.push({ ...e, source: "sdk" });
+  assert.equal(sdk.warm(at).length, 0, "the same call from an app is not");
+});
+
+test("context-watch follows opencode context growth in main conversations only", () => {
+  const out = mapOpencodeRows(
+    rows({
+      sessions: [session()],
+      messages: [message("msg_1", {})],
+      parts: [
+        step("prt_1", "msg_1", TOKENS),
+        step("prt_2", "msg_1", { ...TOKENS, input: 100_000 }, T0 + 2000),
+      ],
+    }),
+  );
+  const watch = createContextWatch({ long: 100_000 });
+  assert.deepEqual(watch.push(out.events[0]), []);
+  assert.deepEqual(
+    watch.push(out.events[1]).map((n) => [n.kind, n.contextTokens, n.added]),
+    [
+      ["jump", 143_000, 99_000],
+      ["long", 143_000, undefined],
+    ],
+  );
+  for (const over of [{ source: "sdk" }, { isSubagent: true }]) {
+    const excluded = createContextWatch({ long: 100_000 });
+    for (const e of out.events) assert.deepEqual(excluded.push({ ...e, ...over }), []);
   }
 });

@@ -59,6 +59,7 @@ function home(withUsage = true) {
   }
   return {
     HOME: dir,
+    XDG_DATA_HOME: path.join(dir, ".local", "share"),
     CLAUDE_CONFIG_DIR: path.join(dir, ".claude"),
     CODEX_HOME: path.join(dir, ".codex"),
     OPTIMAIZR_DIR: path.join(dir, ".optimaizr"),
