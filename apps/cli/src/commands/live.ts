@@ -1,3 +1,5 @@
+import fs from "node:fs";
+
 import {
   accept,
   blue,
@@ -19,9 +21,11 @@ import {
   LIVE_DEFAULTS,
   type LiveRecommendation,
   localTime,
+  loadSqlite,
   modelLabel,
   monthDay,
   PLANS,
+  opencodeDbPath,
   planView,
   red,
   renderBudgetCrossing,
@@ -68,6 +72,7 @@ import {
   statuslineApplied,
   tailCodex,
   tailLedger,
+  tailOpencode,
   tailTranscripts,
 } from "@optimaizr/local";
 import { Args, num } from "../args.js";
@@ -486,6 +491,14 @@ export async function cmdLive(args: Args): Promise<void> {
     else console.log(`\n${renderBudgetCrossing(crossed, daysLeft)}`);
   };
 
+  const opencodeFile = opencodeDbPath();
+  const watchesOpencode = watchesAgents && fs.existsSync(opencodeFile);
+  if (watchesOpencode && !(await loadSqlite())) {
+    (json ? console.error : console.log)(
+      `  ${dim("opencode history needs Node 22.13+ (node:sqlite); skipped")}`,
+    );
+  }
+
   if (!json) {
     console.log("");
     console.log(`  ${bold("optimAIzr")} ${dim("| live")}`);
@@ -540,6 +553,7 @@ export async function cmdLive(args: Args): Promise<void> {
     if (watchesAgents) {
       watching.push(claudeProjectsRoot());
       watching.push(codexSessionsRoot());
+      if (watchesOpencode) watching.push(opencodeFile);
     }
     if (source === "all" || source === "sdk") watching.push(ledgerPath());
     for (const w of watching) console.log(`  ${dim(`watching ${w}`)}`);
@@ -602,6 +616,13 @@ export async function cmdLive(args: Args): Promise<void> {
       }),
     );
     tails.push(tailCodex(onEvent, { keepAlive: true, ...(backfill > 0 ? { backfill } : {}) }));
+    tails.push(
+      tailOpencode(onEvent, {
+        keepAlive: true,
+        ...(backfill > 0 ? { backfill } : {}),
+        onTitle: (id, title) => titles.set(id, title),
+      }),
+    );
   }
 
   const detach = statusLine.attach();
