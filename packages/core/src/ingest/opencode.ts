@@ -230,7 +230,8 @@ export function mapOpencodeRows(rows: OpencodeRows, opts: OpencodeMapOptions = {
       const effort = str(data.variant) || str(chosen.variant) || null;
       const parentID = str(data.parentID);
       const summary = data.summary === true;
-      if (summary && lastContext > 0) {
+      // Only the main conversation's compactions are counted, as for Claude Code.
+      if (summary && lastContext > 0 && !s.parent_id) {
         compactions.push({
           source: "opencode",
           ts: messageTs,

@@ -335,6 +335,9 @@ test("stopping before the loader is ready is safe", async (t) => {
   tail.flush();
 });
 
+// Windows has no SIGINT to send: kill() ends the child abruptly, without its shutdown.
+const noCtrlC = process.platform === "win32" ? "no SIGINT to deliver on Windows" : false;
+
 async function liveCli(t, home, args, check) {
   // Signal only after the CLI installs its handlers, without a timing delay.
   const preload = `
@@ -404,7 +407,7 @@ async function liveCli(t, home, args, check) {
 
 test(
   "CLI watches opencode only for agent sources and notes unavailable SQLite once",
-  { timeout: 15_000 },
+  { skip: noCtrlC, timeout: 15_000 },
   async (t) => {
     const home = tempDir(t);
     const dir = path.join(home, ".local", "share", "opencode");
@@ -434,7 +437,7 @@ test(
 
 test(
   "CLI numeric backfill feeds opencode calls into live analysis",
-  { skip: noSqlite, timeout: 15_000 },
+  { skip: noSqlite || noCtrlC, timeout: 15_000 },
   async (t) => {
     const home = tempDir(t);
     const dir = path.join(home, ".local", "share", "opencode");

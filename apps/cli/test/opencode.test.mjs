@@ -980,3 +980,23 @@ test("context-watch follows opencode context growth in main conversations only",
     for (const e of out.events) assert.deepEqual(excluded.push({ ...e, ...over }), []);
   }
 });
+
+test("a subagent's compaction moves its epoch but isn't counted", () => {
+  const out = mapOpencodeRows(
+    rows({
+      sessions: [session({ parent_id: "ses_parent" })],
+      messages: [
+        message("msg_1", {}, T0),
+        message("msg_2", { summary: true }, T0 + 10_000),
+        message("msg_3", {}, T0 + 20_000),
+      ],
+      parts: [
+        step("prt_1", "msg_1", TOKENS, T0 + 1000),
+        step("prt_2", "msg_2", TOKENS, T0 + 11_000),
+        step("prt_3", "msg_3", TOKENS, T0 + 21_000),
+      ],
+    }),
+  );
+  assert.deepEqual(out.compactions, []);
+  assert.equal(out.events[2].contextEpoch, 1);
+});
