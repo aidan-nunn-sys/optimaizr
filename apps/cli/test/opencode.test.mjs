@@ -881,7 +881,7 @@ test("the database lives under XDG_DATA_HOME when set", () => {
   const before = process.env.XDG_DATA_HOME;
   try {
     process.env.XDG_DATA_HOME = " /tmp/xdg ";
-    assert.equal(opencodeDbPath(), path.join("/tmp/xdg", "opencode", "opencode.db"));
+    assert.equal(opencodeDbPath(), path.join(path.resolve("/tmp/xdg"), "opencode", "opencode.db"));
     process.env.XDG_DATA_HOME = "~/data";
     assert.equal(opencodeDbPath(), path.join(os.homedir(), "data", "opencode", "opencode.db"));
     process.env.XDG_DATA_HOME = " ";

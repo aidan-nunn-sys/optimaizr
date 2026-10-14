@@ -376,6 +376,11 @@ export async function cmdLive(args: Args): Promise<void> {
         );
         continue;
       }
+      // Compaction settings are written for Claude Code and Codex only.
+      if (event.source === "opencode") {
+        console.log(`\n${renderContextNotice(n)}`);
+        continue;
+      }
       const agent = event.source as CompactAgent;
       const set = compactionStatus()[agent];
       if (n.kind !== "long" || offered.has(agent) || set !== null) {

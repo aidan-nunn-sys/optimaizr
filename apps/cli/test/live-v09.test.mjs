@@ -310,7 +310,7 @@ test("the status line says it is watching, then what it has seen", () => {
   const s = emptyStatus(now);
   assert.match(
     strip(renderStatus(s, now)),
-    /optimAIzr live · watching for Claude Code, Codex and API calls/,
+    /optimAIzr live · watching for Claude Code, Codex, opencode and API calls/,
   );
 
   recordCall(s, call({ cacheReadTokens: 182_000, cost: { total: 0.04, cacheRead: 0.03 } }), now);
