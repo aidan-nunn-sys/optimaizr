@@ -18,6 +18,7 @@ import {
   ingestOpencode,
   loadSqlite,
   mapOpencodeRows,
+  OPENCODE_V2_WARNING,
   opencodeDbPath,
   readOpencodeRows,
   toolSignatureOf,
@@ -89,6 +90,36 @@ test("the empty-history notice lists all three coding agents", (t) => {
     result.stdout,
     /optimAIzr reads Claude Code \(~\/\.claude\/projects\), Codex \(~\/\.codex\/sessions\) and opencode \(~\/\.local\/share\/opencode\)\./,
   );
+});
+
+test("the empty-history notice says why an opencode database wasn't read", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-notice-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const xdg = path.join(dir, ".local", "share");
+  fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
+  // Unreadable on every Node: too old for node:sqlite, or not a database.
+  fs.writeFileSync(path.join(xdg, "opencode", "opencode.db"), "not sqlite");
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL("../dist/cli.js", import.meta.url)), "scan"],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: dir,
+        USERPROFILE: dir,
+        XDG_DATA_HOME: xdg,
+        CLAUDE_CONFIG_DIR: path.join(dir, ".claude"),
+        CODEX_HOME: path.join(dir, ".codex"),
+        OPTIMAIZR_DIR: path.join(dir, ".optimaizr"),
+        OPTIMAIZR_NO_UPDATE_CHECK: "1",
+        NO_COLOR: "1",
+      },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /nothing to analyse yet/);
+  assert.match(result.stdout, /warning: opencode(?: history needs Node 22\.13\+|\.db: )/);
 });
 
 test("a step-finish becomes one call with opencode's counts", () => {
@@ -853,6 +884,38 @@ test("a database with an incompatible schema warns", { skip: noSqlite }, async (
   assert.equal(data.events.length, 0);
   assert.equal(data.warnings.length, 1);
 });
+
+test(
+  "an opencode 2.0 database warns instead of failing on the 1.x tables",
+  { skip: noSqlite },
+  async (t) => {
+    const { file, db } = opencodeDb(t);
+    db.exec("DROP TABLE part; DROP TABLE message; DROP TABLE session;");
+    db.exec(
+      "CREATE TABLE session_v2 (id text PRIMARY KEY); INSERT INTO session_v2 VALUES ('ses_v2');",
+    );
+    const data = await ingestOpencode({ db: file });
+    assert.equal(data.events.length, 0);
+    assert.deepEqual(data.warnings, [OPENCODE_V2_WARNING]);
+  },
+);
+
+test(
+  "a database with 1.x and 2.0 history reads 1.x and warns about 2.0",
+  { skip: noSqlite },
+  async (t) => {
+    const { file, db } = opencodeDb(t, (db) => {
+      insertSession(db, "ses_a", T0);
+      insertCall(db, "ses_a", 1, T0 + 1000);
+    });
+    db.exec("CREATE TABLE session_v2 (id text PRIMARY KEY)");
+    assert.deepEqual((await ingestOpencode({ db: file })).warnings, []);
+    db.exec("INSERT INTO session_v2 VALUES ('ses_v2')");
+    const data = await ingestOpencode({ db: file });
+    assert.equal(data.events.length, 1);
+    assert.deepEqual(data.warnings, [OPENCODE_V2_WARNING]);
+  },
+);
 
 test("loadSqlite suppresses only its SQLite ExperimentalWarning", () => {
   const child = spawnSync(

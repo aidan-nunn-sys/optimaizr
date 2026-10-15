@@ -438,6 +438,24 @@ function emptyDataset(warnings: string[]): Dataset {
   return { events: [], window: { from: "", to: "", days: 0 }, sources: [], warnings };
 }
 
+export const OPENCODE_V2_WARNING =
+  "opencode: history from opencode 2.0 (session_v2) isn't read yet, only 1.x sessions";
+
+/**
+ * opencode 2.0 writes `session_v2` and `session_message` and stops writing
+ * the 1.x tables. Which of the two this database has.
+ */
+export function opencodeSchema(db: SqliteDb): { v1: boolean; v2: boolean } {
+  const tables = new Set(
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]
+    ).map((t) => t.name),
+  );
+  const v2 =
+    tables.has("session_v2") && db.prepare("SELECT 1 FROM session_v2 LIMIT 1").all().length > 0;
+  return { v1: tables.has("session"), v2 };
+}
+
 export async function ingestOpencode(opts: OpencodeIngestOptions = {}): Promise<Dataset> {
   const file = opts.db ?? opencodeDbPath();
   if (!fs.existsSync(file)) return emptyDataset([`No opencode history found at ${file}`]);
@@ -448,7 +466,10 @@ export async function ingestOpencode(opts: OpencodeIngestOptions = {}): Promise<
   try {
     const db = new sqlite.DatabaseSync(file, { readOnly: true });
     let mapped: OpencodeMapped;
+    let schema: ReturnType<typeof opencodeSchema>;
     try {
+      schema = opencodeSchema(db);
+      if (schema.v2 && !schema.v1) return emptyDataset([OPENCODE_V2_WARNING]);
       const rows = readOpencodeRows(db, {
         since: opts.days ? Date.now() - opts.days * 86_400_000 : 0,
       });
@@ -456,7 +477,8 @@ export async function ingestOpencode(opts: OpencodeIngestOptions = {}): Promise<
     } finally {
       db.close();
     }
-    const { events, compactions, titles, warnings } = mapped;
+    const { events, compactions, titles } = mapped;
+    const warnings = schema.v2 ? [OPENCODE_V2_WARNING, ...mapped.warnings] : mapped.warnings;
     const from = events[0]?.ts ?? "";
     const to = events[events.length - 1]?.ts ?? "";
     const days =
