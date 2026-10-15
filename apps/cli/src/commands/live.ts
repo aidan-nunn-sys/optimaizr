@@ -25,7 +25,9 @@ import {
   modelLabel,
   monthDay,
   PLANS,
+  OPENCODE_V2_WARNING,
   opencodeDbPath,
+  opencodeSchema,
   planView,
   red,
   renderBudgetCrossing,
@@ -498,10 +500,27 @@ export async function cmdLive(args: Args): Promise<void> {
 
   const opencodeFile = opencodeDbPath();
   const watchesOpencode = watchesAgents && fs.existsSync(opencodeFile);
-  if (watchesOpencode && !(await loadSqlite())) {
-    (json ? console.error : console.log)(
-      `  ${dim("opencode history needs Node 22.13+ (node:sqlite); skipped")}`,
-    );
+  if (watchesOpencode) {
+    const sqlite = await loadSqlite();
+    let v2 = false;
+    if (sqlite) {
+      try {
+        const db = new sqlite.DatabaseSync(opencodeFile, { readOnly: true });
+        try {
+          v2 = opencodeSchema(db).v2;
+        } finally {
+          db.close();
+        }
+      } catch {
+        /* the tail retries a database it can't open yet */
+      }
+    }
+    const note = !sqlite
+      ? "opencode history needs Node 22.13+ (node:sqlite); skipped"
+      : v2
+        ? OPENCODE_V2_WARNING
+        : null;
+    if (note) (json ? console.error : console.log)(`  ${dim(note)}`);
   }
 
   if (!json) {
